@@ -177,3 +177,22 @@ sign-in failures, POS counters gone quiet, outlets without a day closing, automa
 - "Watch can read" stays red: S2 and S3 (password, and the user written as `peasily_watch.hpettlcmkzrslkskwdoh`).
 - Free Supabase projects can be paused after 7 quiet days: opening the wall screen once a week, or the Pro plan, keeps it awake.
 - Re-running `supabase/watch.sql` after an update is safe: it keeps data and the one-minute job.
+
+---
+
+## Version 2 · History and Settings pages (one-time update)
+
+1. **Watch Supabase → SQL Editor → New query →** paste the whole `supabase/watch.sql` → **Run**.
+   It is safe to re-run: data and settings are kept. **Expected:** "Success".
+2. Push the code (Vercel redeploys by itself). **Expected:** the wall has a menu **Wall · History · Settings**.
+3. **Do not tick functions** under Integrations → Data API → Exposed functions. That gives the public key access.
+   The website uses the secret key, which `watch.sql` already allows.
+4. Check that the public key has no access (both must be `false`):
+   ```
+   select has_function_privilege('anon','watch.history(int)','execute'),
+          has_function_privilege('anon','watch.set_setting(text,text,text)','execute');
+   ```
+
+What it adds: alert history (7, 30 or 90 days); settings for the repeat time, a reminder every few hours for
+an alert that was seen but not fixed, and a daily "Watch is alive" Telegram message (on at 9 am by default;
+if it does not arrive, Watch has stopped). Every settings change is recorded with the name of who made it.

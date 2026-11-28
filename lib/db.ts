@@ -28,3 +28,17 @@ export type Snapshot = {
   biggest_tables?: { table: string; bytes: number; rows: number }[];
   slowest?: { what: string; calls: number; mean_ms: number }[];
 };
+
+// History page (watch.history)
+export type HistoryAlert = {
+  id: number; check_key: string; title: string; level: string; detail: string | null;
+  opened_at: string; seen_at: string | null; seen_by: string | null; closed_at: string | null; sends: number;
+};
+export type History = { now: string; days: number; alerts: HistoryAlert[] };
+
+// Settings page (watch.get_settings)
+export type WatchSettings = {
+  values: Record<string, string>;
+  connected: { telegram: boolean; email: boolean; production: boolean; github: boolean };
+  changes: { at: string; key: string; old_value: string | null; new_value: string; changed_by: string }[];
+};

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/guard";
 import { watchDb, type Wall, type Check, type Alert } from "@/lib/db";
+import { Nav } from "./nav";
 
 export const dynamic = "force-dynamic";
 
@@ -147,6 +148,7 @@ export default async function WallScreen({ searchParams }: { searchParams: Promi
   return (
     <main className="wall">
       <meta httpEquiv="refresh" content="30" />
+      <Nav active="wall" />
 
       <header className={`health ${nCrit ? "critical" : nWarn ? "early-warning" : "ok"}`}>
         <Ring fine={nFine} warn={nWarn} crit={nCrit} total={w.checks.length} />

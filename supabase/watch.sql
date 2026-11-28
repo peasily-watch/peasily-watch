@@ -10,7 +10,7 @@
 --      /api/health, and asks GitHub how the last backup and test runs went.
 --   2. watch.evaluate() turns the numbers into checks: ok, early warning or
 --      critical, and opens or closes alerts (one row per problem).
---   3. watch.notify()   sends Telegram (repeated every 2 minutes for a
+--   3. watch.notify()   sends Telegram (repeated every repeat_minutes for a
 --      critical alert until someone presses "Seen" on the wall screen) and
 --      email, through pg_net.
 -- Production keys live ONLY in the Vault of this project, entered by Sandeep
@@ -355,3 +355,154 @@ grant execute on function watch.wall(), watch.seen(bigint, text) to service_role
 -- every minute (re-running this file keeps one job)
 select cron.unschedule(jobid) from cron.job where jobname = 'peasily-watch-tick';
 select cron.schedule('peasily-watch-tick', '* * * * *', $$select watch.tick()$$);
+
+-- =====================================================================
+-- Version 2 · alert history, settings page, reminders, daily "alive"
+-- (safe to re-run; always keep this section at the END of the file)
+-- =====================================================================
+alter table watch.alerts add column if not exists reminded_at timestamptz;
+
+insert into watch.settings (key, value) values
+  ('remind_seen_hours', '4'),   -- remind about a seen but unfixed critical alert (0 = off)
+  ('alive_daily', 'on'),        -- one "Watch is alive" message a day
+  ('alive_hour', '9'),          -- India time, 0 to 23
+  ('alive_sent_on', '')         -- the date it was last sent (Watch fills this)
+on conflict (key) do nothing;
+
+-- who changed which setting from the wall, and when
+create table if not exists watch.setting_changes (
+  id          bigint generated always as identity primary key,
+  at          timestamptz not null default now(),
+  key         text not null,
+  old_value   text,
+  new_value   text not null,
+  changed_by  text not null
+);
+alter table watch.setting_changes enable row level security;
+revoke all on watch.setting_changes from public, anon, authenticated;
+
+-- one Telegram message (nothing happens until the bot and chat are in the Vault)
+create or replace function watch.telegram(p_text text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_bot  text := watch.secret('telegram_bot_token');
+  v_chat text := watch.secret('telegram_chat_id');
+begin
+  if v_bot is not null and v_chat is not null then
+    perform net.http_post(url := 'https://api.telegram.org/bot' || v_bot || '/sendMessage',
+      body := jsonb_build_object('chat_id', v_chat, 'text', p_text, 'disable_web_page_preview', true));
+  end if;
+end $$;
+
+-- every minute: reminders for seen-but-unfixed alerts, and the daily "alive" message
+create or replace function watch.extras() returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  a        record;
+  v_hours  int := coalesce(nullif(watch.setting('remind_seen_hours'), '')::int, 0);
+  v_local  timestamp := now() at time zone 'Asia/Kolkata';
+  v_open   int;
+  v_crit   int;
+  v_last   timestamptz;
+begin
+  if v_hours > 0 then
+    for a in select al.*, ck.title from watch.alerts al join watch.checks ck on ck.key = al.check_key
+              where al.closed_at is null and al.level = 'critical' and al.seen_at is not null
+                and coalesce(al.reminded_at, al.seen_at) < now() - make_interval(hours => v_hours)
+    loop
+      perform watch.telegram('⏰ Still not fixed · ' || a.title || E'\n' || coalesce(a.detail, '')
+        || E'\nSeen by ' || coalesce(a.seen_by, 'someone') || ' ' || floor(extract(epoch from now() - a.seen_at) / 3600)::int || ' h ago'
+        || E'\nRunbook: ' || watch.setting('wall_url') || '/runbook/' || a.check_key);
+      update watch.alerts set reminded_at = now() where id = a.id;
+    end loop;
+  end if;
+
+  if watch.setting('alive_daily') = 'on'
+     and extract(hour from v_local)::int = coalesce(nullif(watch.setting('alive_hour'), '')::int, 9)
+     and coalesce(watch.setting('alive_sent_on'), '') <> to_char(v_local, 'YYYY-MM-DD') then
+    select count(*), count(*) filter (where level = 'critical') into v_open, v_crit from watch.alerts where closed_at is null;
+    select max(at) into v_last from watch.snapshots where ok;
+    perform watch.telegram(
+      case when v_open = 0 then '🟢 Watch is alive · all checks fine'
+           else '🟢 Watch is alive · ' || v_open || ' open (' || v_crit || ' critical)' end
+      || E'\nLast reading of production: ' || coalesce(to_char(v_last at time zone 'Asia/Kolkata', 'DD Mon, HH12:MI am'), 'none yet')
+      || E'\nWall: ' || watch.setting('wall_url'));
+    update watch.settings set value = to_char(v_local, 'YYYY-MM-DD') where key = 'alive_sent_on';
+  end if;
+end $$;
+
+-- the History page: alerts of the last p_days days (1 to 90) plus every open one
+create or replace function watch.history(p_days int default 30) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  with d as (select least(greatest(coalesce(p_days, 30), 1), 90) as n)
+  select jsonb_build_object(
+    'now', now(),
+    'days', (select n from d),
+    'alerts', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', a.id, 'check_key', a.check_key, 'title', coalesce(c.title, a.check_key), 'level', a.level,
+               'detail', a.detail, 'opened_at', a.opened_at, 'seen_at', a.seen_at,
+               'seen_by', case when a.seen_by = 'closed-told' then null else a.seen_by end,
+               'closed_at', a.closed_at, 'sends', a.sends) order by a.opened_at desc)
+        from (select * from watch.alerts
+               where closed_at is null or opened_at > now() - make_interval(days => (select n from d))
+               order by opened_at desc limit 300) a
+        left join watch.checks c on c.key = a.check_key), '[]'::jsonb)
+  )
+$$;
+
+-- the Settings page: the values, which outside services are connected (yes/no only), recent changes
+create or replace function watch.get_settings() returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object(
+    'values', (select jsonb_object_agg(key, value) from watch.settings
+                where key in ('repeat_minutes', 'remind_seen_hours', 'alive_daily', 'alive_hour',
+                              'email_to', 'email_from', 'health_url', 'github_repo', 'wall_url')),
+    'connected', jsonb_build_object(
+      'telegram',   watch.secret('telegram_bot_token') is not null and watch.secret('telegram_chat_id') is not null,
+      'email',      watch.secret('resend_api_key') is not null,
+      'production', watch.secret('prod_watch_url') is not null,
+      'github',     watch.secret('github_token') is not null),
+    'changes', coalesce((select jsonb_agg(to_jsonb(x) order by x.at desc)
+                           from (select at, key, old_value, new_value, changed_by from watch.setting_changes
+                                  order by at desc limit 10) x), '[]'::jsonb)
+  )
+$$;
+
+-- the Settings page saves one value; only these four can be changed from the wall
+create or replace function watch.set_setting(p_key text, p_value text, p_by text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_old text;
+  v_val text := btrim(coalesce(p_value, ''));
+begin
+  if p_key = 'repeat_minutes' then
+    if v_val not in ('2', '5', '10', '15', '30') then raise exception 'Repeat must be 2, 5, 10, 15 or 30 minutes'; end if;
+  elsif p_key = 'remind_seen_hours' then
+    if v_val not in ('0', '2', '4', '8', '12') then raise exception 'Reminder must be off, 2, 4, 8 or 12 hours'; end if;
+  elsif p_key = 'alive_daily' then
+    if v_val not in ('on', 'off') then raise exception 'Daily message must be on or off'; end if;
+  elsif p_key = 'alive_hour' then
+    if v_val !~ '^[0-9]{1,2}$' or v_val::int > 23 then raise exception 'Daily message hour must be 0 to 23'; end if;
+  else
+    raise exception 'This setting cannot be changed from the wall';
+  end if;
+  select value into v_old from watch.settings where key = p_key;
+  if v_old is distinct from v_val then
+    insert into watch.settings (key, value) values (p_key, v_val) on conflict (key) do update set value = excluded.value;
+    insert into watch.setting_changes (key, old_value, new_value, changed_by)
+      values (p_key, v_old, v_val, left(coalesce(nullif(btrim(p_by), ''), 'unknown'), 60));
+  end if;
+end $$;
+
+-- only the website's secret key may call the new pages' functions (never anon)
+revoke execute on function watch.telegram(text), watch.extras(), watch.history(int), watch.get_settings(),
+  watch.set_setting(text, text, text) from public, anon, authenticated;
+grant execute on function watch.history(int), watch.get_settings(), watch.set_setting(text, text, text) to service_role;
+
+-- every minute, as its own job (re-running this file keeps one job)
+select cron.unschedule(jobid) from cron.job where jobname = 'peasily-watch-extras';
+select cron.schedule('peasily-watch-extras', '* * * * *', $$select watch.extras()$$);
+
+-- let the website's Data API see the new functions straight away
+notify pgrst, 'reload schema';
